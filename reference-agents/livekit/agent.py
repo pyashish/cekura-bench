@@ -266,8 +266,7 @@ def _resolve_persona(ctx) -> str:
 
 
 def _id_consumers(tool_defs: list[dict]) -> dict[str, list[str]]:
-    """Map each *_id argument to the tools whose schema takes it (e.g. consent_id ->
-    save_medicare_qualification, create_handoff_summary)."""
+    """Map each *_id argument to the tools whose schema takes it."""
     out: dict[str, list[str]] = {}
     for t in tool_defs:
         for prop in (t.get("parameters") or {}).get("properties", {}):
@@ -277,8 +276,7 @@ def _id_consumers(tool_defs: list[dict]) -> dict[str, list[str]]:
 
 
 def _required_ids(tool_defs: list[dict]) -> dict[str, list[str]]:
-    """Map each tool to the *_id arguments its schema marks required
-    (save_medicare_qualification -> consent_id, book_appointment -> patient_id)."""
+    """Map each tool to the *_id arguments its schema marks required."""
     out: dict[str, list[str]] = {}
     for t in tool_defs:
         ids = [a for a in (t.get("parameters") or {}).get("required", []) if a.endswith("_id")]
@@ -306,32 +304,28 @@ def _make_mock_tool(tdef: dict, backend: MockBackend):
     )
 
 
-# --- Call state the code owns: ids returned by tools.
-#     In the Cekura run GPT-4.1 regularly dropped an id a tool had just returned from
-#     the next call that needed it: consent_id missing from save_medicare_qualification
-#     (where the schema marks it required; raw-schema tools are not strictly enforced)
-#     and from create_handoff_summary (MS62/66/72/74/77/82). Rejecting the bad call and
-#     letting the model retry does not help, because the benchmark scores the extra
-#     call as a false positive, so the call has to be right the first time.
+# --- Call state that code can check without knowing the domain.
+#     Nothing in this section names a tool, an argument value or a step of either
+#     persona. Every rule is derived at start-up from the tool schemas (which
+#     arguments end in _id, which of those are required, which are phone numbers)
+#     and applied to the conversation so far, so it holds for any prompt and tool
+#     set written to the same conventions. The system prompt, the tool schemas and
+#     the tool results are passed through untouched.
 #
-#     Both halves work from the conversation history, not from the local tool
-#     handlers, because on real Cekura calls track_session swaps the handlers for the
-#     dashboard's mock tools and anything done inside _make_mock_tool never runs:
-#       1. before each LLM call, a note after the tool result names the id and the
-#          tools that take it (_with_id_notes);
-#       2. after it, a required id the model still left out, or filled with a value
-#          no tool returned ("pending"), is set to the returned one
-#          (_repair_tool_arguments). Optional ids are left to the model: whether a
-#          handoff summary should carry consent_id depends on which handoff it is.
-#     ARG_REPAIR=false switches both off. ---
-ARG_REPAIR = (_env("ARG_REPAIR", "true") or "").lower() in ("1", "true", "yes")
+#     It runs around the LLM call (BenchmarkAgent.llm_node), not inside the local
+#     tool handlers: on Cekura calls track_session replaces those handlers with the
+#     dashboard's mock tools. A tool call that is corrected or withheld here never
+#     reaches the history in its uncorrected form, which matters because a rejected
+#     call that the model then retries is itself a wrong call.
+#     CALL_STATE_CHECKS=false switches the whole section off. ---
+CALL_STATE_CHECKS = (_env("CALL_STATE_CHECKS", "true") or "").lower() in ("1", "true", "yes")
 
 
 def _returned_ids(output) -> dict[str, str]:
     """Top-level *_id string values of one tool result. Results are stored as text,
     JSON or a Python repr depending on who ran the tool; anything else yields {}.
-    Nested ids (a patient's list of appointments) are deliberately not included:
-    they are choices for the caller, not state to carry forward."""
+    Ids nested inside lists are not included: those are options to choose between,
+    not state to carry forward."""
     value = output
     if isinstance(value, str):
         for parse in (json.loads, ast.literal_eval):
@@ -346,9 +340,11 @@ def _returned_ids(output) -> dict[str, str]:
 
 
 def _with_id_notes(chat_ctx, consumers: dict[str, list[str]]):
-    """A copy of the context with a short system note after each tool result that
-    returned an id later tools take, plus what the repair step needs: the latest
-    value per id and the raw text of every tool result so far."""
+    """Ids are state. When a tool returns an id that other tools take as an argument,
+    the model tends to lose it a few turns later. This returns a copy of the context
+    with a short system note after such a result naming the id and the tools that
+    take it, plus what the repair step needs: the latest value per id and the raw
+    text of every tool result so far."""
     items, latest, outputs, pending = [], {}, [], []
 
     def flush(after) -> None:
@@ -377,60 +373,64 @@ def _with_id_notes(chat_ctx, consumers: dict[str, list[str]]):
     return agents_llm.ChatContext(items), latest, outputs
 
 
-# Arguments the tool contract fixes as a function of another argument, so code can
-# fill them when the model leaves them out. route_medicare_call's schema: "Supply
-# not_applicable for sales, plan-review, non-qualified, or caregiver-authority
-# routes." The model omitted it on the missing-ZIP callback route in 4 of 5 local
-# full runs (MS74).
-_NOT_A_SERVICE_ROUTE = ("sales_or_plan_review", "non_qualified", "caregiver_authority_needed")
+def _repair_tool_arguments(name: str, raw: str, required_ids: dict[str, list[str]],
+                           latest: dict[str, str], outputs: list[str]) -> str:
+    """Fill an id argument the schema marks required when the model left it out or
+    put in a value no tool returned, using the value a tool did return. Optional ids
+    are left alone: whether one belongs in a call is the model's judgement.
+    Returns `raw` untouched unless something had to change."""
+    try:
+        args = json.loads(raw or "{}")
+    except ValueError:
+        return raw
+    if not isinstance(args, dict):
+        return raw
+    fixes: dict = {}
+    for key in required_ids.get(name, ()):
+        known = latest.get(key)
+        if not known:
+            continue  # no tool has returned one yet; nothing to carry
+        value = args.get(key)
+        returned = isinstance(value, str) and value and any(
+            f'"{value}"' in o or f"'{value}'" in o for o in outputs)
+        if not returned:
+            fixes[key] = known
+    if not fixes:
+        return raw
+    logger.info("tool arguments repaired: %s %s", name, fixes)
+    return json.dumps({**args, **fixes})
 
 
-def _derived_arguments(name: str, args: dict) -> dict:
-    if (name == "route_medicare_call" and "service_issue_type" not in args
-            and args.get("route_reason") in _NOT_A_SERVICE_ROUTE):
-        return {"service_issue_type": "not_applicable"}
-    # A consent refusal is closed out with "only the refusal status and non-personal
-    # compliance context" (system prompt, create_handoff_summary). The model sometimes
-    # lists what it had asked before the refusal (product interest, Part A/B) as
-    # fields collected for handoff (MS80); nothing was consented to, so nothing is.
-    if (name == "create_handoff_summary" and args.get("summary_type") == "no_consent_close"
-            and args.get("fields_collected") != []):
-        return {"fields_collected": []}
-    return {}
-
-
-# --- Phone numbers: the tool call must carry the number the caller said.
-#     Over the phone, speech-to-text drops digits. In the Cekura MS76 run the caller
-#     said "nine one six, five five five, zero one nine four", the transcript read
-#     "nine one six five five zero one nine four", and record_medicare_permissions
-#     and save_medicare_qualification both went out with "916550194". That was the
-#     whole failure (3.33/5; 5/5 with the right number). Replaying it locally, the
-#     model more often padded the nine digits to satisfy the schema's "exactly 10
-#     digits" ("9165501940"), which a length check alone would pass.
-#     So code checks provenance, which needs no judgement: a phone argument must be
-#     ten digits and must occur in the digits the caller actually spoke. If not, the
-#     call is held before it is made (it never reaches history, so it is not scored
-#     as an extra call) and the agent asks for the number again. A number the caller
-#     did say but speech-to-text got wrong with the right length is not detectable
-#     here; that is what the read-back is for.
-#     At most MAX_PHONE_REASKS per call, then the model's call goes through. ---
-MAX_PHONE_REASKS = int(_env("MAX_PHONE_REASKS", "2") or 0)
-PHONE_REASK = (" Sorry, I did not catch all ten digits of that phone number. "
+# --- Phone numbers. On a phone line speech-to-text drops, doubles and swaps digits,
+#     and a model given nine digits for a ten-digit field will sometimes invent the
+#     tenth. So before a tool call that carries a phone number is made, two things
+#     are checked that need no judgement:
+#       1. the number has the length the schema asks for and is made of digits the
+#          caller actually spoke; otherwise the caller is asked to say it again;
+#       2. the agent has read that exact number back and the caller has spoken since
+#          (so had the chance to correct it); otherwise it is read back now.
+#     Either way the call is withheld for that turn. At most MAX_PHONE_HOLDS per call,
+#     then the model's call goes through as written. ---
+MAX_PHONE_HOLDS = int(_env("MAX_PHONE_HOLDS", "3") or 0)
+PHONE_REASK = (" Sorry, I did not catch that phone number clearly. "
                "Could you say the full number again, one digit at a time?")
+PHONE_READBACK = " Let me read that number back: {number}. Is that right?"
 _DIGIT_WORDS = {"zero": "0", "oh": "0", "o": "0", "one": "1", "two": "2", "three": "3", "four": "4",
                 "five": "5", "six": "6", "seven": "7", "eight": "8", "nine": "9"}
+_DIGIT_NAMES = ["zero", "one", "two", "three", "four", "five", "six", "seven", "eight", "nine"]
 _REPEATS = {"double": 2, "triple": 3}
 
 
-def _phone_arguments(tool_defs: list[dict]) -> dict[str, list[str]]:
-    """Map each tool to the arguments its schema describes as exactly 10 digits
-    (lookup_patient.phone, callback_phone on the two Medicare intake tools)."""
-    out: dict[str, list[str]] = {}
+def _phone_arguments(tool_defs: list[dict]) -> dict[str, dict[str, int]]:
+    """Map each tool to its phone-number arguments and the digit count each needs:
+    string arguments with "phone" in the name; the count is whatever the schema
+    description states ("exactly 10 digits"), ten if it states none."""
+    out: dict[str, dict[str, int]] = {}
     for t in tool_defs:
-        props = (t.get("parameters") or {}).get("properties", {})
-        args = [k for k, v in props.items() if "exactly 10 digits" in (v.get("description") or "")]
-        if args:
-            out[t["name"]] = args
+        for key, prop in (t.get("parameters") or {}).get("properties", {}).items():
+            if "phone" in key.lower() and prop.get("type") == "string":
+                stated = re.search(r"(\d+)\s+digits", prop.get("description") or "")
+                out.setdefault(t["name"], {})[key] = int(stated.group(1)) if stated else 10
     return out
 
 
@@ -450,60 +450,53 @@ def _spoken_digits(text: str) -> str:
     return "".join(out)
 
 
-def _caller_digits(chat_ctx) -> str:
-    """Every digit the caller has spoken so far, across turns (a number given in two
-    halves around a pause, AS58, is still one run)."""
-    return "".join(_spoken_digits(i.text_content or "") for i in chat_ctx.items
-                   if getattr(i, "type", None) == "message" and i.role == "user")
+def _say_digits(digits: str) -> str:
+    """Digits as words in spoken groups (3-3-4 for ten digits), for text-to-speech."""
+    sizes = [3, 3, 4] if len(digits) == 10 else [3] * (len(digits) // 3 + 1)
+    groups, at = [], 0
+    for size in sizes:
+        if digits[at:at + size]:
+            groups.append(" ".join(_DIGIT_NAMES[int(d)] for d in digits[at:at + size]))
+        at += size
+    return ", ".join(groups)
 
 
-def _bad_phone(name: str, raw: str, phone_args: dict[str, list[str]], caller_digits: str) -> str | None:
-    """The first phone argument of this call that is not a ten-digit number the
-    caller said, or None. Eleven digits with a leading 1 is a formatting slip, not
-    a mishearing, and is judged on its last ten."""
+def _heard_and_read_back(chat_ctx) -> tuple[str, list[str]]:
+    """(every digit the caller has spoken, across turns; the digits of each agent
+    message the caller has spoken after). A number given in two halves around a
+    pause is still one run of caller digits."""
+    messages = [i for i in chat_ctx.items
+                if getattr(i, "type", None) == "message" and i.role in ("user", "assistant")]
+    caller = "".join(_spoken_digits(m.text_content or "") for m in messages if m.role == "user")
+    last_user = max((n for n, m in enumerate(messages) if m.role == "user"), default=-1)
+    read_back = [_spoken_digits(m.text_content or "") for n, m in enumerate(messages)
+                 if m.role == "assistant" and n < last_user]
+    return caller, read_back
+
+
+def _phone_problem(name: str, raw: str, phone_args: dict[str, dict[str, int]],
+                   caller_digits: str, read_back: list[str]) -> tuple[str, str] | None:
+    """What is wrong with the first phone argument of this tool call, if anything:
+    ("unheard", value) when it is not a number of the required length that the
+    caller said, ("unconfirmed", digits) when it has not been read back yet."""
     try:
         args = json.loads(raw or "{}")
     except ValueError:
         return None
     if not isinstance(args, dict):
         return None
-    for key in phone_args.get(name, ()):
+    for key, length in phone_args.get(name, {}).items():
         value = args.get(key)
         if not isinstance(value, str):
             continue
         digits = "".join(c for c in value if c.isdigit())
-        if len(digits) == 11 and digits.startswith("1"):
-            digits = digits[1:]
-        if len(digits) != 10 or digits not in caller_digits:
-            return value
+        if len(digits) == length + 1 and digits.startswith("1"):
+            digits = digits[1:]  # a country code is a formatting slip, not a mishearing
+        if len(digits) != length or digits not in caller_digits:
+            return ("unheard", value)
+        if not any(digits in said for said in read_back):
+            return ("unconfirmed", digits)
     return None
-
-
-def _repair_tool_arguments(name: str, raw: str, required_ids: dict[str, list[str]],
-                           latest: dict[str, str], outputs: list[str]) -> str:
-    """The model's arguments for one tool call, with the state code owns filled in.
-    Returns `raw` untouched unless something had to change."""
-    try:
-        args = json.loads(raw or "{}")
-    except ValueError:
-        return raw
-    if not isinstance(args, dict):
-        return raw
-    fixes: dict = {}
-    for key in required_ids.get(name, ()):
-        known = latest.get(key)
-        if not known:
-            continue  # no tool has returned one yet; nothing to carry
-        value = args.get(key)
-        returned = isinstance(value, str) and value and any(
-            f'"{value}"' in o or f"'{value}'" in o for o in outputs)
-        if not returned:
-            fixes[key] = known
-    fixes.update(_derived_arguments(name, {**args, **fixes}))
-    if not fixes:
-        return raw
-    logger.info("tool arguments repaired: %s %s", name, fixes)
-    return json.dumps({**args, **fixes})
 
 
 # --- native end-call. The framework ships an EndCallTool (livekit.agents.beta.tools),
@@ -515,22 +508,13 @@ def _repair_tool_arguments(name: str, raw: str, required_ids: dict[str, list[str
 #     and making the sign-off part of the tool call guarantees the caller hears
 #     a final utterance before the line drops. The tool speaks it, then ends the
 #     call. ---
-_ANYTHING_ELSE = ("anything else", "something else", "else i can", "else can i", "else you need",
-                  "other questions", "any other", "help with anything")
-_CALLER_DONE = ("bye", "have to go", "gotta go", "got to go", "need to go", "that's all", "that is all",
-                "nothing else", "no, that's it", "that's it", "all set", "i'm good", "no thanks",
-                "no thank you", "don't need anything else", "do not need anything else")
-# How many times each check may refuse end_call before it goes through anyway.
-# "disposition" refuses once: one of its answers is "nothing to record, end the call".
-_MAX_REFUSALS = {"disposition": 1}
-
-
-def _routes_without_handoff(items) -> list[tuple[str, str]]:
-    """(route_id, route_reason) for each route this call made that no handoff summary
-    refers to. The public-resource redirect (non_qualified) needs none: the prompt
-    makes that route the complete record. Every other route in the published
-    scenarios is followed by a create_handoff_summary carrying its route_id."""
-    reason_by_call, routes, summarised = {}, [], set()
+def _unused_ids(items, consumers: dict[str, list[str]]) -> list[tuple[str, str, str, list[str]]]:
+    """(key, value, producing tool, tools that take it) for each id a tool returned
+    that no later call passed on, when another id of the same kind was passed on.
+    The asymmetry is the signal: one of two parallel pieces of work was finished and
+    the other was not. An id kind that is never passed on at all says nothing."""
+    returned: list[tuple[str, str, str]] = []
+    used: set[tuple[str, str]] = set()
     for item in items:
         kind = getattr(item, "type", None)
         if kind == "function_call":
@@ -538,81 +522,65 @@ def _routes_without_handoff(items) -> list[tuple[str, str]]:
                 args = json.loads(getattr(item, "arguments", None) or "{}")
             except ValueError:
                 args = {}
-            if item.name == "route_medicare_call":
-                reason_by_call[getattr(item, "call_id", None)] = args.get("route_reason")
-            elif item.name == "create_handoff_summary" and args.get("route_id"):
-                summarised.add(args["route_id"])
-        elif kind == "function_call_output" and item.call_id in reason_by_call:
-            route_id = _returned_ids(item.output).get("route_id")
-            if route_id and reason_by_call[item.call_id] != "non_qualified":
-                routes.append((route_id, reason_by_call[item.call_id]))
-    return [r for r in routes if r[0] not in summarised]
+            if isinstance(args, dict):
+                used |= {(k, v) for k, v in args.items() if k.endswith("_id") and isinstance(v, str)}
+        elif kind == "function_call_output" and not getattr(item, "is_error", False):
+            returned += [(k, v, item.name) for k, v in _returned_ids(item.output).items()]
+    kinds_in_use = {k for k, _ in used}
+    out = []
+    for key, value, producer in returned:
+        takers = [t for t in consumers.get(key, []) if t != producer]
+        if takers and key in kinds_in_use and (key, value) not in used:
+            out.append((key, value, producer, takers))
+    return out
 
 
-def _end_call_precondition(session) -> tuple[str, str] | None:
-    """What still has to happen before this call may end, as (key, instruction).
+def _hangup_checks(session) -> list[tuple[str, str]]:
+    """The checks this call owes before it may end, as (key, what to tell the model).
 
-    In the Cekura run the model hung up with the caller's request unhandled or
-    unrecorded: right after reading back an appointment (AS22, caller then asked
-    for a follow-up), before ever calling lookup_patient (AS10), or after giving
-    public Medicare resources without the route_medicare_call record the prompt
-    requires (MS65, MS80, MS76). These checks are deterministic facts about the
-    call so far; the model still decides what to do about them."""
+    Hanging up cannot be undone, and the commonest serious failure of an agent like
+    this is to end the call with something its own instructions required left
+    undone. So end_call is answered with a check instead of a hang-up, one check per
+    attempt, each put once per call. The checks know nothing about the domain: they
+    point the model at its instructions and add whatever plain facts the history
+    shows. One question at a time, because given two the model answers the easier.
+      "tools": no tool has run on this call at all. Either that is right (the caller
+               left early, or asked for something that must be refused) or a required
+               lookup or record was skipped.
+      "close": anything still undone, and whether the caller is finished."""
     items = list(session.history.items)
-    called = {i.name for i in items if getattr(i, "type", None) == "function_call"}
-    tools = set()
-    try:
-        tools = {getattr(t, "id", None) or getattr(t, "name", None) for t in session.current_agent.tools}
-    except Exception:
-        pass
-    msgs = [i for i in items if getattr(i, "type", None) == "message" and i.role in ("user", "assistant")]
-    last_user = next((m.text_content or "" for m in reversed(msgs) if m.role == "user"), "").lower()
-    caller_done = any(p in last_user for p in _CALLER_DONE)
-
-    if "lookup_patient" in tools and "lookup_patient" not in called:
-        return ("identify", "You skipped Step 2: lookup_patient was never called. Every appointment request, "
-                "including a caller who says they are a new patient, must be checked against the records. If "
-                "the caller already gave a phone number, call lookup_patient with it now (no need to ask "
-                "again), tell them the result, then close. Only if this call is an emergency, outside the "
-                "clinic's scope, or the caller refused to give a number, call end_call again instead.")
-    if "route_medicare_call" in tools and not {"route_medicare_call", "create_handoff_summary"} & called:
-        # Whether anything needs recording is a judgement about the call, so the model
-        # makes it. The no-record case comes first: a caller who leaves during the
-        # opening (MS79) must not get a routing record. A goodbye is not evidence
-        # either way (in MS65 the caller says goodbye after being given the redirect),
-        # which is why this is not a keyword test on the caller's last words.
-        return ("disposition", "No outcome is recorded for this call yet. Decide which one of these "
-                "describes the call, do only that, then end the call.\n"
-                "1. The caller left before you handled any request, for example during or right after "
-                "the opening disclosure: there is nothing to record. Call end_call again.\n"
-                "2. The caller refused permission: do not route. Record the closeout with "
-                "create_handoff_summary (summary_type no_consent_close, route_status closed_no_consent).\n"
-                "3. You pointed a caller who is not yet on Medicare to public resources: call "
-                "route_medicare_call with route_reason non_qualified, the product_interest the caller "
-                "stated if they stated one, service_issue_type not_applicable and availability_context "
-                "normal. That route is the complete record; do not create a handoff summary for it.\n"
-                "4. The caller has an issue with an existing plan: call route_medicare_call with "
-                "route_reason member_services and the service_issue_type, then record the handoff.")
-    unrecorded = _routes_without_handoff(items)
-    if unrecorded:
-        # MS76: with two requests on one call, the member-services route was made
-        # and only the sales handoff was written up.
-        listed = ", ".join(f"{route_id} ({reason})" for route_id, reason in unrecorded)
-        return ("handoff", f"A route on this call has no handoff record: {listed}. Call "
-                "create_handoff_summary for it now, with its route_id and the route_status and "
-                "destination that route returned (summary_type member_services_redirect for a "
-                "member-services route). Then end the call.")
-    if not caller_done:
-        # the agent's message just before the caller's latest turn
-        prev_agent = ""
-        for m in reversed(msgs):
-            if m.role == "assistant":
-                prev_agent = (m.text_content or "").lower()
-                break
-        if not any(p in prev_agent for p in _ANYTHING_ELSE):
-            return ("anything_else", "Before ending, ask the caller whether there is anything else you "
-                    "can help with, as a normal message, and wait for their answer.")
-    return None
+    current = getattr(session, "current_agent", None)
+    worked = any(getattr(i, "type", None) == "function_call" and i.name != "end_call" for i in items)
+    checks = []
+    if not worked:
+        # one more plain fact when the schemas support it: the caller read out a number
+        # as long as the phone number some tool takes, and that tool never ran
+        phone_args = getattr(current, "_phone_args", None) or {}
+        lengths = [n for args in phone_args.values() for n in args.values()]
+        said_number = lengths and any(
+            len(_spoken_digits(i.text_content or "")) >= min(lengths) for i in items
+            if getattr(i, "type", None) == "message" and i.role == "user")
+        fact = (f" The caller gave a phone number and {', '.join(sorted(phone_args))} "
+                f"take{'s' if len(phone_args) == 1 else ''} one." if said_number else "")
+        checks.append(("tools", "Not ended; the call is still open. No tool has been called on this "
+                       f"call.{fact} Go through the steps your instructions give for a call like this "
+                       "one. If any step is a tool call (a lookup, a check, or a record of how the call "
+                       "ended), make that call now, using what the caller already told you; a caller "
+                       "telling you what a lookup would find does not replace the lookup. If your "
+                       "instructions require no tool call here (for example the caller left before "
+                       "asking for anything, or asked for something you must refuse), call end_call "
+                       "again."))
+    consumers = getattr(current, "_id_consumers", None) or {}
+    facts = "".join(f' {producer} returned {key} "{value}", which no later call has used, although '
+                    f'another {key} on this call was ({", ".join(takers)} take it).'
+                    for key, value, producer, takers in _unused_ids(items, consumers))
+    if facts:
+        facts += " If your instructions require something for it, do that now."
+    checks.append(("close", f"Not ended; the call is still open. One more check before the line drops.{facts} "
+                   "Has the caller said they need nothing more, or said goodbye? If not, ask whether "
+                   "there is anything else, as a normal message, and wait for the answer. If they have, "
+                   "call end_call again."))
+    return checks
 
 
 @function_tool
@@ -638,26 +606,20 @@ async def end_call(ctx: RunContext, closing_message: str) -> str:
     do NOT call this tool yet. Call this tool at most ONCE per call; put the
     entire sign-off in this argument instead of saying it as a separate message."""
     session = ctx.session
-    # Code-owned preconditions, checked before anything is spoken. A failed check
-    # refuses the hang-up and says what is missing. Each check refuses a limited
-    # number of times per call (_MAX_REFUSALS, default 2) and then lets the call
-    # end, so a call that legitimately skips the step (emergency, refusal,
-    # injection attempt) still ends. The count is per call, not per turn: a model
-    # that answers a refusal with "one moment, I'll check" and no tool call is
-    # refused again when it next tries to hang up (AS10). end_call is a control
-    # tool, so a refused call does not count against Tool Call Accuracy.
+    # Hang-up is held until each applicable check (_hangup_checks) has been put to
+    # the model once; then end_call goes through whatever the model decided. Nothing
+    # is spoken to the caller while it is held. end_call is a control tool, not part
+    # of the scored tool contract.
     if not getattr(session, "_end_call_guard", False):
-        reason = _end_call_precondition(session)
-        if reason:
-            refusals = getattr(session, "_end_call_refusals", None)
-            if refusals is None:
-                refusals = {}
-                setattr(session, "_end_call_refusals", refusals)
-            count = refusals.get(reason[0], 0)
-            if count < _MAX_REFUSALS.get(reason[0], 2):
-                refusals[reason[0]] = count + 1
-                logger.info("end_call deferred: %s (%d)", reason[0], count + 1)
-                return f"Not ended; the call is still open. {reason[1]}"
+        asked = getattr(session, "_end_call_checks", None)
+        if asked is None:
+            asked = set()
+            setattr(session, "_end_call_checks", asked)
+        for key, check in _hangup_checks(session):
+            if key not in asked:
+                asked.add(key)
+                logger.info("end_call held for the %r check", key)
+                return check
     # The call ends once. In simulations the session outlives the hang-up (the
     # room is not deleted, see below), so the caller may keep exchanging
     # pleasantries and the model may invoke end_call again. Answer those trailing
@@ -740,29 +702,9 @@ async def _wait_until_answered(ctx: JobContext, timeout: float = 45.0) -> rtc.Re
     return participant
 
 
-# Runtime addendum to the frozen appointments prompt (a prompt change, kept out of
-# definitions/ so the benchmark input stays byte-identical). In audio runs with
-# background noise or packet loss, STT swaps or drops digits of the caller's phone
-# number and the model called lookup_patient with what it heard, unconfirmed
-# (local AS28/AS31/AS51/AS55/AS56; Cekura AS58). A wrong argument cannot be fixed
-# after the fact (a rejected call still counts as an extra call), so confirmation
-# has to happen before the call.
-PHONE_READBACK_RULE = """
-# Phone number capture (audio reliability)
-- Phone audio often drops or swaps digits. After the caller gives a phone number,
-  read it back digit by digit in groups of three, three and four, and ask them to
-  confirm before calling lookup_patient.
-- If you heard fewer or more than ten digits, or any part was unclear, ask only for
-  the missing or unclear part, then read back the whole number again.
-- After any correction, read back the full corrected number and wait for a clear yes.
-- Never call lookup_patient with a number the caller has not confirmed."""
-
-
 def _load_persona(persona: str):
     d = DEFINITIONS / persona
     prompt = (d / "system-prompt.txt").read_text().rstrip("\n")
-    if persona == "appointments" and (_env("PHONE_READBACK", "true") or "").lower() in ("1", "true", "yes"):
-        prompt += "\n" + PHONE_READBACK_RULE
     first_message = (d / "first-message.txt").read_text().strip()
     backend = MockBackend(d / "mock-tools.json")
     tool_defs = _load_tool_defs(persona)
@@ -775,18 +717,15 @@ def _load_tool_defs(persona: str) -> list[dict]:
     return json.loads((DEFINITIONS / persona / "tool-definitions.json").read_text())
 
 
-# Seconds of mutual silence before the agent re-prompts (0 disables). Cekura counts
-# more than 10 s without an agent response as an infrastructure failure (AS50, AS39),
-# and AS44/AS46 expect the agent to re-ask once after a 6-8 s caller pause. Short
-# enough to stay under 10 s, long enough not to fire inside the 2-3 s mid-utterance
-# pauses of AS57/AS58.
+# Seconds of mutual silence before the agent re-prompts (0 disables). A line that
+# stays dead for ten seconds reads as a dropped call, so the re-prompt has to come
+# before that; it also has to be long enough not to cut into a caller who pauses for
+# a few seconds in the middle of a sentence or a number.
 REPROMPT_AFTER_S = float(_env("REPROMPT_AFTER_S", "6") or 0)
-# After a re-prompt the caller needs time to hear it and answer; a second nudge at
-# 6 s made AS44 (expects exactly one re-ask) fail when the caller answered at ~8 s.
+# After a re-prompt the caller needs time to hear it and answer before another one.
 REPROMPT_AGAIN_AFTER_S = max(REPROMPT_AFTER_S, 10.0)
-# One re-prompt. A second one made AS44 (expects exactly one re-ask) fail in 2 of 6
-# audio runs when the simulated caller was slow to answer the first; the original
-# agent, with no re-prompt at all, passed AS44. Raise only with evidence.
+# One re-prompt per silence by default: a caller who is slow to answer the first
+# should not be asked twice.
 MAX_REPROMPTS = int(_env("MAX_REPROMPTS", "1") or 1)
 
 
@@ -798,8 +737,7 @@ def _attach_silence_reprompt(session: AgentSession) -> None:
     talking, and cancelled by any caller speech or agent activity. Because the agent's
     own re-prompt ends in "listening" again, the timer re-arms after it, up to
     MAX_REPROMPTS in a row (the framework's user "away" event fires only once per
-    silence, which left the second re-prompt out in AS46). Caller speech resets the
-    count. Never after end_call."""
+    silence). Caller speech resets the count. Never after end_call."""
     if not REPROMPT_AFTER_S:
         return
     state: dict = {"count": 0, "task": None}
@@ -854,40 +792,42 @@ class BenchmarkAgent(Agent):
         self._id_consumers = _id_consumers(tool_defs or [])
         self._required_ids = _required_ids(tool_defs or [])
         self._phone_args = _phone_arguments(tool_defs or [])
-        self._phone_reasks = 0
+        self._phone_holds = 0
 
     async def llm_node(self, chat_ctx, tools, model_settings):
-        if not ARG_REPAIR:
+        """The default LLM step, with the call-state checks around it (see "Call
+        state that code can check" above)."""
+        if not CALL_STATE_CHECKS:
             async for chunk in Agent.default.llm_node(self, chat_ctx, tools, model_settings):
                 yield chunk
             return
         ctx, latest, outputs = _with_id_notes(chat_ctx, self._id_consumers)
-        caller_digits = _caller_digits(chat_ctx)
-        held = False  # a tool call whose phone number the caller never said was withheld
+        caller_digits, read_back = _heard_and_read_back(chat_ctx)
+        say = None  # set when a tool call was withheld over its phone number
         async for chunk in Agent.default.llm_node(self, ctx, tools, model_settings):
             delta = getattr(chunk, "delta", None)
             tool_calls = getattr(delta, "tool_calls", None) or []
-            if tool_calls and not held and self._phone_reasks < MAX_PHONE_REASKS:
+            if tool_calls and say is not None:
+                delta.tool_calls = tool_calls = []  # nothing after a withheld call runs this turn
+            elif tool_calls and self._phone_holds < MAX_PHONE_HOLDS:
                 for index, tool_call in enumerate(tool_calls):
-                    bad = _bad_phone(tool_call.name, tool_call.arguments, self._phone_args, caller_digits)
-                    if bad is not None:
-                        # keep the calls before it; this one and any after it wait
-                        # for the corrected number
-                        held, tool_calls = True, tool_calls[:index]
-                        self._phone_reasks += 1
-                        logger.info("held %s: phone %r is not a ten-digit number the caller said; asking again (%d)",
-                                    tool_call.name, bad, self._phone_reasks)
-                        break
-                if held:
-                    delta.tool_calls = tool_calls
-            elif tool_calls and held:
-                delta.tool_calls = tool_calls = []
+                    problem = _phone_problem(tool_call.name, tool_call.arguments, self._phone_args,
+                                             caller_digits, read_back)
+                    if problem is None:
+                        continue
+                    # the calls before it still run; this one and any after it wait
+                    delta.tool_calls = tool_calls = tool_calls[:index]
+                    self._phone_holds += 1
+                    say = (PHONE_REASK if problem[0] == "unheard"
+                           else PHONE_READBACK.format(number=_say_digits(problem[1])))
+                    logger.info("held %s: phone number %s (%d)", tool_call.name, problem[0], self._phone_holds)
+                    break
             for tool_call in tool_calls:
                 tool_call.arguments = _repair_tool_arguments(
                     tool_call.name, tool_call.arguments, self._required_ids, latest, outputs)
             yield chunk
-        if held:
-            yield PHONE_REASK
+        if say is not None:
+            yield say
 
     async def on_enter(self):
         # Fixed first message: speak it deterministically via session.say() so it
@@ -895,13 +835,10 @@ class BenchmarkAgent(Agent):
         await self.session.say(self._first_message)
 
 
-# One tool call per model response. Every tool in both personas takes something an
-# earlier tool returns (consent_id -> lead_id -> route_id; patient_id), so a call
-# issued in the same response as the one that produces its input cannot be right.
-# That is what the dropped consent_id was: across 246 save_medicare_qualification
-# calls in the local runs, the 8 without a consent_id were exactly the 8 the model
-# issued in parallel with record_medicare_permissions, and all 238 sequential ones
-# carried it.
+# One tool call per model response. In a tool set where one call returns an id that
+# the next call requires, two such calls issued in the same response cannot both be
+# right: the second is written before the id exists. In local runs every call that
+# was missing a required id had been issued that way, and no sequential call was.
 PARALLEL_TOOL_CALLS = (_env("PARALLEL_TOOL_CALLS", "false") or "").lower() in ("1", "true", "yes")
 
 
@@ -1060,12 +997,6 @@ async def entrypoint(ctx: JobContext):
         nc = ai_coustics.audio_enhancement(model=ai_coustics.EnhancerModel.QUAIL_L)
     else:
         nc = noise_cancellation.BVC()
-    # Experiment override (dead-air investigation): off | nc | bvc | bvc_telephony
-    nc_override = (_env("NOISE_CANCELLATION", "") or "").lower()
-    if nc_override:
-        nc = {"off": None, "nc": noise_cancellation.NC(), "bvc": noise_cancellation.BVC(),
-              "bvc_telephony": noise_cancellation.BVCTelephony()}[nc_override]
-        logger.info("noise cancellation override: %s", nc_override)
 
     await session.start(
         agent=agent,
