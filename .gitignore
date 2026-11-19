@@ -22,6 +22,3 @@ reference-agents/pipecat-s2s/pcc-deploy.toml
 
 # Rendered caller audio: bin/render-corpus.py writes it; manifest.json keeps the checksums.
 corpus/service/audio/
-
-# Local simulation harness for the LiveKit reference agent: kept out of the repo for now.
-local-sim/

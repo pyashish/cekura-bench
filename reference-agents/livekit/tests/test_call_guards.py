@@ -319,14 +319,6 @@ def test_disposition_instruction_names_every_field_the_prompt_requires():
         assert field in text
 
 
-def test_grading_hook_imports_inside_the_deployed_image(monkeypatch):
-    """agent.py imports sim_grading in production; at /app there is no repo above it."""
-    import sim_grading
-    monkeypatch.delenv("SIM_LOCAL_DIR", raising=False)
-    monkeypatch.setattr(sim_grading, "__file__", "/app/sim_grading.py")
-    assert sim_grading._local_sim() == Path("/app/local-sim")
-
-
 class FakeSession:
     def __init__(self):
         self.handlers, self.replies = {}, []

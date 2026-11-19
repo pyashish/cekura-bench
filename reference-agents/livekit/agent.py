@@ -62,7 +62,13 @@ except ImportError:
 from cekura.livekit import LiveKitTracer
 
 from mock_backend import MockBackend
-from sim_grading import on_simulation_end
+
+try:
+    # Optional local-development hook: grades `lk agent simulate` runs against the
+    # benchmark's tool-call scorer. It is not part of this repo or the deployed image.
+    from sim_grading import on_simulation_end
+except ImportError:
+    on_simulation_end = None
 
 logger = logging.getLogger("livekit-demo")
 
