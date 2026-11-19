@@ -23,15 +23,18 @@ metadata (scenario_id/run_id — no PSTN-style matching) and, when the Cekura ag
 has mock tools configured, injects them in place of the same-named local tools
 (disable with CEKURA_MOCK_TOOLS_ENABLED=false to force local mock_backend).
 """
+import ast
 import asyncio
 import json
 import logging
 import os
+import re
 import time
 from pathlib import Path
 
 from dotenv import load_dotenv
 from livekit import api, rtc
+from livekit.protocol import agent_simulation as agent_simulation_proto
 from livekit.agents import (
     Agent,
     AgentServer,
@@ -40,6 +43,7 @@ from livekit.agents import (
     inference,
     JobContext,
     cli,
+    llm as agents_llm,
     function_tool,
     get_job_context,
     RunContext,
@@ -58,6 +62,13 @@ except ImportError:
 from cekura.livekit import LiveKitTracer
 
 from mock_backend import MockBackend
+
+try:
+    # Optional local-development hook: grades `lk agent simulate` runs against the
+    # benchmark's tool-call scorer. It is not part of this repo or the deployed image.
+    from sim_grading import on_simulation_end
+except ImportError:
+    on_simulation_end = None
 
 logger = logging.getLogger("livekit-demo")
 
@@ -254,9 +265,30 @@ def _resolve_persona(ctx) -> str:
     return persona
 
 
+def _id_consumers(tool_defs: list[dict]) -> dict[str, list[str]]:
+    """Map each *_id argument to the tools whose schema takes it."""
+    out: dict[str, list[str]] = {}
+    for t in tool_defs:
+        for prop in (t.get("parameters") or {}).get("properties", {}):
+            if prop.endswith("_id"):
+                out.setdefault(prop, []).append(t["name"])
+    return out
+
+
+def _required_ids(tool_defs: list[dict]) -> dict[str, list[str]]:
+    """Map each tool to the *_id arguments its schema marks required."""
+    out: dict[str, list[str]] = {}
+    for t in tool_defs:
+        ids = [a for a in (t.get("parameters") or {}).get("required", []) if a.endswith("_id")]
+        if ids:
+            out[t["name"]] = ids
+    return out
+
+
 def _make_mock_tool(tdef: dict, backend: MockBackend):
     """Wrap one entry of tool-definitions.json (the fixed cross-platform tool
-    contract) as a raw-schema function tool resolving against the mock backend."""
+    contract) as a raw-schema function tool resolving against the mock backend.
+    The fixture output is returned unchanged."""
     name = tdef["name"]
 
     async def handler(raw_arguments: dict) -> dict:
@@ -272,6 +304,201 @@ def _make_mock_tool(tdef: dict, backend: MockBackend):
     )
 
 
+# --- Call state that code can check without knowing the domain.
+#     Nothing in this section names a tool, an argument value or a step of either
+#     persona. Every rule is derived at start-up from the tool schemas (which
+#     arguments end in _id, which of those are required, which are phone numbers)
+#     and applied to the conversation so far, so it holds for any prompt and tool
+#     set written to the same conventions. The system prompt, the tool schemas and
+#     the tool results are passed through untouched.
+#
+#     It runs around the LLM call (BenchmarkAgent.llm_node), not inside the local
+#     tool handlers: on Cekura calls track_session replaces those handlers with the
+#     dashboard's mock tools. A tool call that is corrected or withheld here never
+#     reaches the history in its uncorrected form, which matters because a rejected
+#     call that the model then retries is itself a wrong call.
+#     CALL_STATE_CHECKS=false switches the whole section off. ---
+CALL_STATE_CHECKS = (_env("CALL_STATE_CHECKS", "true") or "").lower() in ("1", "true", "yes")
+
+
+def _returned_ids(output) -> dict[str, str]:
+    """Top-level *_id string values of one tool result. Results are stored as text,
+    JSON or a Python repr depending on who ran the tool; anything else yields {}.
+    Ids nested inside lists are not included: those are options to choose between,
+    not state to carry forward."""
+    value = output
+    if isinstance(value, str):
+        for parse in (json.loads, ast.literal_eval):
+            try:
+                value = parse(output)
+                break
+            except (ValueError, SyntaxError):
+                continue
+    if not isinstance(value, dict):
+        return {}
+    return {k: v for k, v in value.items() if k.endswith("_id") and isinstance(v, str) and v}
+
+
+def _with_id_notes(chat_ctx, consumers: dict[str, list[str]]):
+    """Ids are state. When a tool returns an id that other tools take as an argument,
+    the model tends to lose it a few turns later. This returns a copy of the context
+    with a short system note after such a result naming the id and the tools that
+    take it, plus what the repair step needs: the latest value per id and the raw
+    text of every tool result so far."""
+    items, latest, outputs, pending = [], {}, [], []
+
+    def flush(after) -> None:
+        if pending:
+            items.append(agents_llm.ChatMessage(role="system", content=["; ".join(pending)],
+                                                created_at=after.created_at))
+            pending.clear()
+
+    prev = None
+    for item in chat_ctx.items:
+        kind = getattr(item, "type", None)
+        # keep a tool call and all of its results together; the note goes after them
+        if kind not in ("function_call", "function_call_output") and prev is not None:
+            flush(prev)
+        items.append(item)
+        prev = item
+        if kind == "function_call_output" and not getattr(item, "is_error", False):
+            outputs.append(str(item.output))
+            for key, value in _returned_ids(item.output).items():
+                latest[key] = value
+                users = [t for t in consumers.get(key, []) if t != item.name]
+                if users:
+                    pending.append(f'pass {key} "{value}" in every later call to {", ".join(users)}')
+    if prev is not None:
+        flush(prev)
+    return agents_llm.ChatContext(items), latest, outputs
+
+
+def _repair_tool_arguments(name: str, raw: str, required_ids: dict[str, list[str]],
+                           latest: dict[str, str], outputs: list[str]) -> str:
+    """Fill an id argument the schema marks required when the model left it out or
+    put in a value no tool returned, using the value a tool did return. Optional ids
+    are left alone: whether one belongs in a call is the model's judgement.
+    Returns `raw` untouched unless something had to change."""
+    try:
+        args = json.loads(raw or "{}")
+    except ValueError:
+        return raw
+    if not isinstance(args, dict):
+        return raw
+    fixes: dict = {}
+    for key in required_ids.get(name, ()):
+        known = latest.get(key)
+        if not known:
+            continue  # no tool has returned one yet; nothing to carry
+        value = args.get(key)
+        returned = isinstance(value, str) and value and any(
+            f'"{value}"' in o or f"'{value}'" in o for o in outputs)
+        if not returned:
+            fixes[key] = known
+    if not fixes:
+        return raw
+    logger.info("tool arguments repaired: %s %s", name, fixes)
+    return json.dumps({**args, **fixes})
+
+
+# --- Phone numbers. On a phone line speech-to-text drops, doubles and swaps digits,
+#     and a model given nine digits for a ten-digit field will sometimes invent the
+#     tenth. So before a tool call that carries a phone number is made, two things
+#     are checked that need no judgement:
+#       1. the number has the length the schema asks for and is made of digits the
+#          caller actually spoke; otherwise the caller is asked to say it again;
+#       2. the agent has read that exact number back and the caller has spoken since
+#          (so had the chance to correct it); otherwise it is read back now.
+#     Either way the call is withheld for that turn. At most MAX_PHONE_HOLDS per call,
+#     then the model's call goes through as written. ---
+MAX_PHONE_HOLDS = int(_env("MAX_PHONE_HOLDS", "3") or 0)
+PHONE_REASK = (" Sorry, I did not catch that phone number clearly. "
+               "Could you say the full number again, one digit at a time?")
+PHONE_READBACK = " Let me read that number back: {number}. Is that right?"
+_DIGIT_WORDS = {"zero": "0", "oh": "0", "o": "0", "one": "1", "two": "2", "three": "3", "four": "4",
+                "five": "5", "six": "6", "seven": "7", "eight": "8", "nine": "9"}
+_DIGIT_NAMES = ["zero", "one", "two", "three", "four", "five", "six", "seven", "eight", "nine"]
+_REPEATS = {"double": 2, "triple": 3}
+
+
+def _phone_arguments(tool_defs: list[dict]) -> dict[str, dict[str, int]]:
+    """Map each tool to its phone-number arguments and the digit count each needs:
+    string arguments with "phone" in the name; the count is whatever the schema
+    description states ("exactly 10 digits"), ten if it states none."""
+    out: dict[str, dict[str, int]] = {}
+    for t in tool_defs:
+        for key, prop in (t.get("parameters") or {}).get("properties", {}).items():
+            if "phone" in key.lower() and prop.get("type") == "string":
+                stated = re.search(r"(\d+)\s+digits", prop.get("description") or "")
+                out.setdefault(t["name"], {})[key] = int(stated.group(1)) if stated else 10
+    return out
+
+
+def _spoken_digits(text: str) -> str:
+    """The digits in what someone said, in order, whether transcribed as numerals
+    ("916-555-0194") or words ("nine one six, double five five, oh one nine four").
+    Everything else is skipped, so a number split by filler words still joins up."""
+    out, repeat = [], 1
+    for token in re.findall(r"[a-z]+|\d", text.lower()):
+        if token in _REPEATS:
+            repeat = _REPEATS[token]
+            continue
+        digit = token if token.isdigit() else _DIGIT_WORDS.get(token)
+        if digit is not None:
+            out.append(digit * repeat)
+        repeat = 1
+    return "".join(out)
+
+
+def _say_digits(digits: str) -> str:
+    """Digits as words in spoken groups (3-3-4 for ten digits), for text-to-speech."""
+    sizes = [3, 3, 4] if len(digits) == 10 else [3] * (len(digits) // 3 + 1)
+    groups, at = [], 0
+    for size in sizes:
+        if digits[at:at + size]:
+            groups.append(" ".join(_DIGIT_NAMES[int(d)] for d in digits[at:at + size]))
+        at += size
+    return ", ".join(groups)
+
+
+def _heard_and_read_back(chat_ctx) -> tuple[str, list[str]]:
+    """(every digit the caller has spoken, across turns; the digits of each agent
+    message the caller has spoken after). A number given in two halves around a
+    pause is still one run of caller digits."""
+    messages = [i for i in chat_ctx.items
+                if getattr(i, "type", None) == "message" and i.role in ("user", "assistant")]
+    caller = "".join(_spoken_digits(m.text_content or "") for m in messages if m.role == "user")
+    last_user = max((n for n, m in enumerate(messages) if m.role == "user"), default=-1)
+    read_back = [_spoken_digits(m.text_content or "") for n, m in enumerate(messages)
+                 if m.role == "assistant" and n < last_user]
+    return caller, read_back
+
+
+def _phone_problem(name: str, raw: str, phone_args: dict[str, dict[str, int]],
+                   caller_digits: str, read_back: list[str]) -> tuple[str, str] | None:
+    """What is wrong with the first phone argument of this tool call, if anything:
+    ("unheard", value) when it is not a number of the required length that the
+    caller said, ("unconfirmed", digits) when it has not been read back yet."""
+    try:
+        args = json.loads(raw or "{}")
+    except ValueError:
+        return None
+    if not isinstance(args, dict):
+        return None
+    for key, length in phone_args.get(name, {}).items():
+        value = args.get(key)
+        if not isinstance(value, str):
+            continue
+        digits = "".join(c for c in value if c.isdigit())
+        if len(digits) == length + 1 and digits.startswith("1"):
+            digits = digits[1:]  # a country code is a formatting slip, not a mishearing
+        if len(digits) != length or digits not in caller_digits:
+            return ("unheard", value)
+        if not any(digits in said for said in read_back):
+            return ("unconfirmed", digits)
+    return None
+
+
 # --- native end-call. The framework ships an EndCallTool (livekit.agents.beta.tools),
 #     but it is still beta, so we define our own: the hang-up is deleting the room
 #     (disconnects everyone, ends the SIP/telephony leg). Defined in-code (not in the
@@ -281,6 +508,81 @@ def _make_mock_tool(tdef: dict, backend: MockBackend):
 #     and making the sign-off part of the tool call guarantees the caller hears
 #     a final utterance before the line drops. The tool speaks it, then ends the
 #     call. ---
+def _unused_ids(items, consumers: dict[str, list[str]]) -> list[tuple[str, str, str, list[str]]]:
+    """(key, value, producing tool, tools that take it) for each id a tool returned
+    that no later call passed on, when another id of the same kind was passed on.
+    The asymmetry is the signal: one of two parallel pieces of work was finished and
+    the other was not. An id kind that is never passed on at all says nothing."""
+    returned: list[tuple[str, str, str]] = []
+    used: set[tuple[str, str]] = set()
+    for item in items:
+        kind = getattr(item, "type", None)
+        if kind == "function_call":
+            try:
+                args = json.loads(getattr(item, "arguments", None) or "{}")
+            except ValueError:
+                args = {}
+            if isinstance(args, dict):
+                used |= {(k, v) for k, v in args.items() if k.endswith("_id") and isinstance(v, str)}
+        elif kind == "function_call_output" and not getattr(item, "is_error", False):
+            returned += [(k, v, item.name) for k, v in _returned_ids(item.output).items()]
+    kinds_in_use = {k for k, _ in used}
+    out = []
+    for key, value, producer in returned:
+        takers = [t for t in consumers.get(key, []) if t != producer]
+        if takers and key in kinds_in_use and (key, value) not in used:
+            out.append((key, value, producer, takers))
+    return out
+
+
+def _hangup_checks(session) -> list[tuple[str, str]]:
+    """The checks this call owes before it may end, as (key, what to tell the model).
+
+    Hanging up cannot be undone, and the commonest serious failure of an agent like
+    this is to end the call with something its own instructions required left
+    undone. So end_call is answered with a check instead of a hang-up, one check per
+    attempt, each put once per call. The checks know nothing about the domain: they
+    point the model at its instructions and add whatever plain facts the history
+    shows. One question at a time, because given two the model answers the easier.
+      "tools": no tool has run on this call at all. Either that is right (the caller
+               left early, or asked for something that must be refused) or a required
+               lookup or record was skipped.
+      "close": anything still undone, and whether the caller is finished."""
+    items = list(session.history.items)
+    current = getattr(session, "current_agent", None)
+    worked = any(getattr(i, "type", None) == "function_call" and i.name != "end_call" for i in items)
+    checks = []
+    if not worked:
+        # one more plain fact when the schemas support it: the caller read out a number
+        # as long as the phone number some tool takes, and that tool never ran
+        phone_args = getattr(current, "_phone_args", None) or {}
+        lengths = [n for args in phone_args.values() for n in args.values()]
+        said_number = lengths and any(
+            len(_spoken_digits(i.text_content or "")) >= min(lengths) for i in items
+            if getattr(i, "type", None) == "message" and i.role == "user")
+        fact = (f" The caller gave a phone number and {', '.join(sorted(phone_args))} "
+                f"take{'s' if len(phone_args) == 1 else ''} one." if said_number else "")
+        checks.append(("tools", "Not ended; the call is still open. No tool has been called on this "
+                       f"call.{fact} Go through the steps your instructions give for a call like this "
+                       "one. If any step is a tool call (a lookup, a check, or a record of how the call "
+                       "ended), make that call now, using what the caller already told you; a caller "
+                       "telling you what a lookup would find does not replace the lookup. If your "
+                       "instructions require no tool call here (for example the caller left before "
+                       "asking for anything, or asked for something you must refuse), call end_call "
+                       "again."))
+    consumers = getattr(current, "_id_consumers", None) or {}
+    facts = "".join(f' {producer} returned {key} "{value}", which no later call has used, although '
+                    f'another {key} on this call was ({", ".join(takers)} take it).'
+                    for key, value, producer, takers in _unused_ids(items, consumers))
+    if facts:
+        facts += " If your instructions require something for it, do that now."
+    checks.append(("close", f"Not ended; the call is still open. One more check before the line drops.{facts} "
+                   "Has the caller said they need nothing more, or said goodbye? If not, ask whether "
+                   "there is anything else, as a normal message, and wait for the answer. If they have, "
+                   "call end_call again."))
+    return checks
+
+
 @function_tool
 async def end_call(ctx: RunContext, closing_message: str) -> str:
     """Hang up the call, speaking `closing_message` as your final utterance first.
@@ -304,6 +606,20 @@ async def end_call(ctx: RunContext, closing_message: str) -> str:
     do NOT call this tool yet. Call this tool at most ONCE per call; put the
     entire sign-off in this argument instead of saying it as a separate message."""
     session = ctx.session
+    # Hang-up is held until each applicable check (_hangup_checks) has been put to
+    # the model once; then end_call goes through whatever the model decided. Nothing
+    # is spoken to the caller while it is held. end_call is a control tool, not part
+    # of the scored tool contract.
+    if not getattr(session, "_end_call_guard", False):
+        asked = getattr(session, "_end_call_checks", None)
+        if asked is None:
+            asked = set()
+            setattr(session, "_end_call_checks", asked)
+        for key, check in _hangup_checks(session):
+            if key not in asked:
+                asked.add(key)
+                logger.info("end_call held for the %r check", key)
+                return check
     # The call ends once. In simulations the session outlives the hang-up (the
     # room is not deleted, see below), so the caller may keep exchanging
     # pleasantries and the model may invoke end_call again. Answer those trailing
@@ -391,21 +707,139 @@ def _load_persona(persona: str):
     prompt = (d / "system-prompt.txt").read_text().rstrip("\n")
     first_message = (d / "first-message.txt").read_text().strip()
     backend = MockBackend(d / "mock-tools.json")
-    tool_defs = json.loads((d / "tool-definitions.json").read_text())
+    tool_defs = _load_tool_defs(persona)
     tools = [_make_mock_tool(t, backend) for t in tool_defs]
     tools.append(end_call)
     return prompt, first_message, tools
 
 
+def _load_tool_defs(persona: str) -> list[dict]:
+    return json.loads((DEFINITIONS / persona / "tool-definitions.json").read_text())
+
+
+# Seconds of mutual silence before the agent re-prompts (0 disables). A line that
+# stays dead for ten seconds reads as a dropped call, so the re-prompt has to come
+# before that; it also has to be long enough not to cut into a caller who pauses for
+# a few seconds in the middle of a sentence or a number.
+REPROMPT_AFTER_S = float(_env("REPROMPT_AFTER_S", "6") or 0)
+# After a re-prompt the caller needs time to hear it and answer before another one.
+REPROMPT_AGAIN_AFTER_S = max(REPROMPT_AFTER_S, 10.0)
+# One re-prompt per silence by default: a caller who is slow to answer the first
+# should not be asked twice.
+MAX_REPROMPTS = int(_env("MAX_REPROMPTS", "1") or 1)
+
+
+def _attach_silence_reprompt(session: AgentSession) -> None:
+    """When nobody has spoken for REPROMPT_AFTER_S while the agent is waiting on the
+    caller, re-ask instead of sitting in silence.
+
+    A timer is armed whenever the agent goes back to listening or the caller stops
+    talking, and cancelled by any caller speech or agent activity. Because the agent's
+    own re-prompt ends in "listening" again, the timer re-arms after it, up to
+    MAX_REPROMPTS in a row (the framework's user "away" event fires only once per
+    silence). Caller speech resets the count. Never after end_call."""
+    if not REPROMPT_AFTER_S:
+        return
+    state: dict = {"count": 0, "task": None}
+
+    def cancel() -> None:
+        task = state["task"]
+        if task is not None and not task.done():
+            task.cancel()
+        state["task"] = None
+
+    async def wait_then_reprompt() -> None:
+        await asyncio.sleep(REPROMPT_AFTER_S if state["count"] == 0 else REPROMPT_AGAIN_AFTER_S)
+        if (getattr(session, "_end_call_guard", False) or state["count"] >= MAX_REPROMPTS
+                or session.agent_state != "listening" or session.user_state == "speaking"):
+            return
+        state["count"] += 1
+        logger.info("caller silent for %.0fs; re-prompt %d", REPROMPT_AFTER_S, state["count"])
+        instructions = (
+            "The caller has gone quiet. In one short sentence, check they are still there "
+            "and repeat your last question. Do not call any tools."
+            if state["count"] == 1 else
+            "The caller is still silent. Say briefly that you may be having trouble hearing "
+            "them, and invite them to repeat their answer. Do not call any tools."
+        )
+        session.generate_reply(instructions=instructions, tool_choice="none")
+
+    def arm() -> None:
+        cancel()
+        state["task"] = asyncio.create_task(wait_then_reprompt())
+
+    @session.on("agent_state_changed")
+    def _on_agent_state(ev) -> None:
+        if ev.new_state == "listening" and session.user_state != "speaking":
+            arm()
+        else:
+            cancel()
+
+    @session.on("user_state_changed")
+    def _on_user_state(ev) -> None:
+        if ev.new_state == "speaking":
+            state["count"] = 0
+            cancel()
+        elif ev.new_state == "listening" and session.agent_state == "listening":
+            arm()
+
+
 class BenchmarkAgent(Agent):
-    def __init__(self, instructions: str, tools: list, first_message: str):
+    def __init__(self, instructions: str, tools: list, first_message: str,
+                 tool_defs: list[dict] | None = None):
         super().__init__(instructions=instructions, tools=tools)
         self._first_message = first_message
+        self._id_consumers = _id_consumers(tool_defs or [])
+        self._required_ids = _required_ids(tool_defs or [])
+        self._phone_args = _phone_arguments(tool_defs or [])
+        self._phone_holds = 0
+
+    async def llm_node(self, chat_ctx, tools, model_settings):
+        """The default LLM step, with the call-state checks around it (see "Call
+        state that code can check" above)."""
+        if not CALL_STATE_CHECKS:
+            async for chunk in Agent.default.llm_node(self, chat_ctx, tools, model_settings):
+                yield chunk
+            return
+        ctx, latest, outputs = _with_id_notes(chat_ctx, self._id_consumers)
+        caller_digits, read_back = _heard_and_read_back(chat_ctx)
+        say = None  # set when a tool call was withheld over its phone number
+        async for chunk in Agent.default.llm_node(self, ctx, tools, model_settings):
+            delta = getattr(chunk, "delta", None)
+            tool_calls = getattr(delta, "tool_calls", None) or []
+            if tool_calls and say is not None:
+                delta.tool_calls = tool_calls = []  # nothing after a withheld call runs this turn
+            elif tool_calls and self._phone_holds < MAX_PHONE_HOLDS:
+                for index, tool_call in enumerate(tool_calls):
+                    problem = _phone_problem(tool_call.name, tool_call.arguments, self._phone_args,
+                                             caller_digits, read_back)
+                    if problem is None:
+                        continue
+                    # the calls before it still run; this one and any after it wait
+                    delta.tool_calls = tool_calls = tool_calls[:index]
+                    self._phone_holds += 1
+                    say = (PHONE_REASK if problem[0] == "unheard"
+                           else PHONE_READBACK.format(number=_say_digits(problem[1])))
+                    logger.info("held %s: phone number %s (%d)", tool_call.name, problem[0], self._phone_holds)
+                    break
+            for tool_call in tool_calls:
+                tool_call.arguments = _repair_tool_arguments(
+                    tool_call.name, tool_call.arguments, self._required_ids, latest, outputs)
+            yield chunk
+        if say is not None:
+            yield say
 
     async def on_enter(self):
         # Fixed first message: speak it deterministically via session.say() so it
         # plays immediately with zero LLM latency. Left interruptible (default).
         await self.session.say(self._first_message)
+
+
+# One tool call per model response. In a tool set where one call returns an id that
+# the next call requires, two such calls issued in the same response cannot both be
+# right: the second is written before the id exists. In local runs every call that
+# was missing a required id had been issued that way, and no sequential call was.
+PARALLEL_TOOL_CALLS = (_env("PARALLEL_TOOL_CALLS", "false") or "").lower() in ("1", "true", "yes")
 
 
 def _build_llm():
@@ -415,7 +849,8 @@ def _build_llm():
     if _env("LLM_SOURCE", "platform") == "platform":
         from livekit.agents import inference
         return inference.LLM(model=LLM_MODEL,
-                             extra_kwargs={"temperature": LLM_TEMPERATURE})
+                             extra_kwargs={"temperature": LLM_TEMPERATURE,
+                                           "parallel_tool_calls": PARALLEL_TOOL_CALLS})
     # fallback: BYO Azure (pre-mandate config, kept for rollback/A-B)
     return openai.LLM.with_azure(
         azure_deployment=LLM_DEPLOYMENT,
@@ -423,12 +858,13 @@ def _build_llm():
         api_key=_env("AZURE_OPENAI_API_KEY") or _env("OPENAI_API_KEY"),
         api_version=_env("AZURE_OPENAI_API_VERSION", "2024-12-01-preview"),
         temperature=LLM_TEMPERATURE,
+        parallel_tool_calls=PARALLEL_TOOL_CALLS,
     )
 
 
 server = AgentServer()
 
-@server.rtc_session(agent_name="cekura-benchmark-agent")
+@server.rtc_session(agent_name="cekura-benchmark-agent", on_simulation_end=on_simulation_end)
 async def entrypoint(ctx: JobContext):
     # Connect FIRST: the persona comes from the Cekura agent's "LiveKit Config
     # (JSON)", which arrives as room metadata and is empty until ctx.connect().
@@ -518,7 +954,11 @@ async def entrypoint(ctx: JobContext):
             preemptive_generation={"enabled": True},
         ),
     )
-    agent = BenchmarkAgent(prompt, tools, first_message)
+    agent = BenchmarkAgent(prompt, tools, first_message, tool_defs=_load_tool_defs(persona))
+    # Silence is an audio concept; in a text simulation a slow simulated reply is not dead air.
+    _sim = _sim_fn() if callable(_sim_fn) else None
+    if _sim is None or _sim.simulation_mode != agent_simulation_proto.SimulationMode.SIMULATION_MODE_TEXT:
+        _attach_silence_reprompt(session)
 
     if cekura_agent_id and not in_simulation:
         # Cekura voice calls: transcript/tool export keyed by dispatch metadata
@@ -536,7 +976,8 @@ async def entrypoint(ctx: JobContext):
 
     # outbound: don't speak the first message until the callee has answered
     # (inbound passes through immediately — see _wait_until_answered docstring)
-    remote = await _wait_until_answered(ctx)
+    # console mode runs in a local fake room with no remote participant to wait for
+    remote = None if ctx.is_fake_job() else await _wait_until_answered(ctx)
 
     if cekura_agent_id and not in_simulation:
         # production/observe: audio recording (dual-channel egress) + call log.
