@@ -74,6 +74,29 @@ async def test_refusals_count_per_call_not_per_turn(monkeypatch):
     assert spoken == ["Bye"]
 
 
+def test_every_route_but_the_public_redirect_needs_a_handoff_summary():
+    """MS76: member-services route made, sales handoff written, member-services handoff forgotten."""
+    L = agent.agents_llm
+    member = [_call("route_medicare_call", "r1", json.dumps({"route_reason": "member_services",
+                                                              "service_issue_type": "claim"})),
+              _output("route_medicare_call", "r1", str({"route_id": "route_3007", "route_status": "x"}))]
+    sales = [_call("route_medicare_call", "r2", json.dumps({"route_reason": "sales_or_plan_review"})),
+             _output("route_medicare_call", "r2", json.dumps({"route_id": "route_3017"})),
+             _call("create_handoff_summary", "h2", json.dumps({"route_id": "route_3017",
+                                                               "summary_type": "warm_transfer"}))]
+    close = [L.ChatMessage(role="assistant", content=["Is there anything else I can help with?"]),
+             L.ChatMessage(role="user", content=["No, that's all. Goodbye."])]
+    key, text = agent._end_call_precondition(session("insurance", member + sales + close))
+    assert key == "handoff" and "route_3007 (member_services)" in text and "route_3017" not in text
+
+    done = [_call("create_handoff_summary", "h1", json.dumps({"route_id": "route_3007"}))]
+    assert agent._end_call_precondition(session("insurance", member + sales + done + close)) is None
+
+    redirect = [_call("route_medicare_call", "r3", json.dumps({"route_reason": "non_qualified"})),
+                _output("route_medicare_call", "r3", json.dumps({"route_id": "route_3009"}))]
+    assert agent._end_call_precondition(session("insurance", redirect + close)) is None
+
+
 def test_must_ask_anything_else_unless_caller_is_done():
     items = [call("lookup_patient"), msg("assistant", "Your appointment is on July 8 at 9."),
              msg("user", "Great, thanks.")]
@@ -189,6 +212,104 @@ def test_service_issue_type_follows_the_route_reason():
     assert "service_issue_type" not in _repair("route_medicare_call", member, {}, [])
     stated = {"route_reason": "non_qualified", "service_issue_type": "other"}
     assert _repair("route_medicare_call", stated, {}, [])["service_issue_type"] == "other"
+
+
+def test_refusal_closeout_lists_no_collected_fields():
+    """MS80: the model listed product interest and Part A/B on a no-consent close-out."""
+    closeout = {"summary_type": "no_consent_close", "route_status": "closed_no_consent",
+                "destination": "Medicare.gov", "compliance_notes": "refused",
+                "fields_collected": ["product_interest: medicare_advantage"]}
+    assert _repair("create_handoff_summary", closeout, {}, [])["fields_collected"] == []
+    transfer = {**closeout, "summary_type": "warm_transfer"}
+    assert _repair("create_handoff_summary", transfer, {}, [])["fields_collected"] == closeout["fields_collected"]
+
+
+def test_phone_arguments_come_from_the_schema():
+    assert agent._phone_arguments(_tool_defs("appointments")) == {"lookup_patient": ["phone"]}
+    assert agent._phone_arguments(_tool_defs("insurance")) == {
+        "record_medicare_permissions": ["callback_phone"], "save_medicare_qualification": ["callback_phone"]}
+
+
+HEARD = "My callback number is nine one six five five zero one nine four."     # Cekura MS76, as transcribed
+SAID = "My callback number is nine one six, five five five, zero one nine four."
+
+
+@pytest.mark.parametrize("text,digits", [
+    (SAID, "9165550194"), ("It's 916-555-0194.", "9165550194"),
+    ("nine one six, uh, double five five, oh one nine four", "9165550194"),
+    ("I also want to shop for next year.", ""),
+])
+def test_spoken_digits(text, digits):
+    assert agent._spoken_digits(text) == digits
+
+
+@pytest.mark.parametrize("heard,number,bad", [
+    (HEARD, "916550194", True),     # what the agent sent on Cekura: one digit short
+    (HEARD, "9165501940", True),    # what it more often does locally: pads to ten digits
+    (HEARD, "9165550194", True),    # right by luck is still not what was heard
+    (SAID, "9165550194", False), (SAID, "19165550194", False), (SAID, "916-555-0194", False),
+])
+def test_phone_argument_must_be_ten_digits_the_caller_said(heard, number, bad):
+    phones = agent._phone_arguments(_tool_defs("insurance"))
+    raw = json.dumps({"caller_name": "Grace Thompson", "callback_phone": number})
+    said = agent._spoken_digits(heard)
+    assert (agent._bad_phone("record_medicare_permissions", raw, phones, said) is not None) is bad
+    assert agent._bad_phone("route_medicare_call", raw, phones, said) is None  # not a phone-taking tool
+
+
+def test_number_given_in_two_turns_counts_as_said():
+    ctx = _history(agent.agents_llm.ChatMessage(role="user", content=["It's two zero two five five five"]),
+                   agent.agents_llm.ChatMessage(role="assistant", content=["Go on."]),
+                   agent.agents_llm.ChatMessage(role="user", content=["zero one eight eight."]))
+    phones = agent._phone_arguments(_tool_defs("appointments"))
+    assert agent._bad_phone("lookup_patient", '{"phone": "2025550188"}', phones, agent._caller_digits(ctx)) is None
+
+
+class _Stream:
+    """Stands in for the default llm_node: yields the given chunks."""
+
+    def __init__(self, chunks):
+        self.chunks = chunks
+
+    def __call__(self, *_):
+        async def gen():
+            for c in self.chunks:
+                yield c
+        return gen()
+
+
+def _tool_chunk(*calls):
+    L = agent.agents_llm
+    return L.ChatChunk(id="c", delta=L.ChoiceDelta(role="assistant", tool_calls=[
+        L.FunctionToolCall(name=n, arguments=json.dumps(a), call_id=f"call_{i}") for i, (n, a) in enumerate(calls)]))
+
+
+async def _drive(ava, monkeypatch, chunk, *caller_lines):
+    monkeypatch.setattr(agent.Agent.default, "llm_node", _Stream([chunk]))
+    ctx = _history(*(agent.agents_llm.ChatMessage(role="user", content=[line]) for line in caller_lines))
+    return [c async for c in ava.llm_node(ctx, [], None)]
+
+
+async def test_call_with_a_number_the_caller_did_not_say_is_held_and_asked_again(monkeypatch):
+    prompt, first, tools = agent._load_persona("insurance")
+    ava = agent.BenchmarkAgent(prompt, tools, first, tool_defs=_tool_defs("insurance"))
+    route = ("route_medicare_call", {"route_reason": "member_services", "service_issue_type": "claim"})
+    padded = ("record_medicare_permissions", {"caller_name": "Grace Thompson", "callback_phone": "9165501940"})
+    save = ("save_medicare_qualification", {"caller_name": "Grace Thompson", "callback_phone": "9165501940"})
+
+    out = await _drive(ava, monkeypatch, _tool_chunk(route, padded, save), HEARD)
+    assert [t.name for t in out[0].delta.tool_calls] == ["route_medicare_call"]  # the valid call still runs
+    assert out[-1] == agent.PHONE_REASK
+
+    good = ("record_medicare_permissions", {"caller_name": "Grace Thompson", "callback_phone": "9165550194"})
+    out = await _drive(ava, monkeypatch, _tool_chunk(good), HEARD, SAID)
+    assert [t.name for t in out[0].delta.tool_calls] == ["record_medicare_permissions"] and len(out) == 1
+
+    # after MAX_PHONE_REASKS the model's call goes through rather than looping on the caller
+    await _drive(ava, monkeypatch, _tool_chunk(padded), HEARD)
+    out = await _drive(ava, monkeypatch, _tool_chunk(padded), HEARD)
+    assert ava._phone_reasks == agent.MAX_PHONE_REASKS
+    assert [t.name for t in out[0].delta.tool_calls] == ["record_medicare_permissions"] and len(out) == 1
 
 
 def test_disposition_instruction_names_every_field_the_prompt_requires():

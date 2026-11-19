@@ -28,6 +28,7 @@ import asyncio
 import json
 import logging
 import os
+import re
 import time
 from pathlib import Path
 
@@ -382,7 +383,94 @@ def _derived_arguments(name: str, args: dict) -> dict:
     if (name == "route_medicare_call" and "service_issue_type" not in args
             and args.get("route_reason") in _NOT_A_SERVICE_ROUTE):
         return {"service_issue_type": "not_applicable"}
+    # A consent refusal is closed out with "only the refusal status and non-personal
+    # compliance context" (system prompt, create_handoff_summary). The model sometimes
+    # lists what it had asked before the refusal (product interest, Part A/B) as
+    # fields collected for handoff (MS80); nothing was consented to, so nothing is.
+    if (name == "create_handoff_summary" and args.get("summary_type") == "no_consent_close"
+            and args.get("fields_collected") != []):
+        return {"fields_collected": []}
     return {}
+
+
+# --- Phone numbers: the tool call must carry the number the caller said.
+#     Over the phone, speech-to-text drops digits. In the Cekura MS76 run the caller
+#     said "nine one six, five five five, zero one nine four", the transcript read
+#     "nine one six five five zero one nine four", and record_medicare_permissions
+#     and save_medicare_qualification both went out with "916550194". That was the
+#     whole failure (3.33/5; 5/5 with the right number). Replaying it locally, the
+#     model more often padded the nine digits to satisfy the schema's "exactly 10
+#     digits" ("9165501940"), which a length check alone would pass.
+#     So code checks provenance, which needs no judgement: a phone argument must be
+#     ten digits and must occur in the digits the caller actually spoke. If not, the
+#     call is held before it is made (it never reaches history, so it is not scored
+#     as an extra call) and the agent asks for the number again. A number the caller
+#     did say but speech-to-text got wrong with the right length is not detectable
+#     here; that is what the read-back is for.
+#     At most MAX_PHONE_REASKS per call, then the model's call goes through. ---
+MAX_PHONE_REASKS = int(_env("MAX_PHONE_REASKS", "2") or 0)
+PHONE_REASK = (" Sorry, I did not catch all ten digits of that phone number. "
+               "Could you say the full number again, one digit at a time?")
+_DIGIT_WORDS = {"zero": "0", "oh": "0", "o": "0", "one": "1", "two": "2", "three": "3", "four": "4",
+                "five": "5", "six": "6", "seven": "7", "eight": "8", "nine": "9"}
+_REPEATS = {"double": 2, "triple": 3}
+
+
+def _phone_arguments(tool_defs: list[dict]) -> dict[str, list[str]]:
+    """Map each tool to the arguments its schema describes as exactly 10 digits
+    (lookup_patient.phone, callback_phone on the two Medicare intake tools)."""
+    out: dict[str, list[str]] = {}
+    for t in tool_defs:
+        props = (t.get("parameters") or {}).get("properties", {})
+        args = [k for k, v in props.items() if "exactly 10 digits" in (v.get("description") or "")]
+        if args:
+            out[t["name"]] = args
+    return out
+
+
+def _spoken_digits(text: str) -> str:
+    """The digits in what someone said, in order, whether transcribed as numerals
+    ("916-555-0194") or words ("nine one six, double five five, oh one nine four").
+    Everything else is skipped, so a number split by filler words still joins up."""
+    out, repeat = [], 1
+    for token in re.findall(r"[a-z]+|\d", text.lower()):
+        if token in _REPEATS:
+            repeat = _REPEATS[token]
+            continue
+        digit = token if token.isdigit() else _DIGIT_WORDS.get(token)
+        if digit is not None:
+            out.append(digit * repeat)
+        repeat = 1
+    return "".join(out)
+
+
+def _caller_digits(chat_ctx) -> str:
+    """Every digit the caller has spoken so far, across turns (a number given in two
+    halves around a pause, AS58, is still one run)."""
+    return "".join(_spoken_digits(i.text_content or "") for i in chat_ctx.items
+                   if getattr(i, "type", None) == "message" and i.role == "user")
+
+
+def _bad_phone(name: str, raw: str, phone_args: dict[str, list[str]], caller_digits: str) -> str | None:
+    """The first phone argument of this call that is not a ten-digit number the
+    caller said, or None. Eleven digits with a leading 1 is a formatting slip, not
+    a mishearing, and is judged on its last ten."""
+    try:
+        args = json.loads(raw or "{}")
+    except ValueError:
+        return None
+    if not isinstance(args, dict):
+        return None
+    for key in phone_args.get(name, ()):
+        value = args.get(key)
+        if not isinstance(value, str):
+            continue
+        digits = "".join(c for c in value if c.isdigit())
+        if len(digits) == 11 and digits.startswith("1"):
+            digits = digits[1:]
+        if len(digits) != 10 or digits not in caller_digits:
+            return value
+    return None
 
 
 def _repair_tool_arguments(name: str, raw: str, required_ids: dict[str, list[str]],
@@ -431,6 +519,30 @@ _CALLER_DONE = ("bye", "have to go", "gotta go", "got to go", "need to go", "tha
 _MAX_REFUSALS = {"disposition": 1}
 
 
+def _routes_without_handoff(items) -> list[tuple[str, str]]:
+    """(route_id, route_reason) for each route this call made that no handoff summary
+    refers to. The public-resource redirect (non_qualified) needs none: the prompt
+    makes that route the complete record. Every other route in the published
+    scenarios is followed by a create_handoff_summary carrying its route_id."""
+    reason_by_call, routes, summarised = {}, [], set()
+    for item in items:
+        kind = getattr(item, "type", None)
+        if kind == "function_call":
+            try:
+                args = json.loads(getattr(item, "arguments", None) or "{}")
+            except ValueError:
+                args = {}
+            if item.name == "route_medicare_call":
+                reason_by_call[getattr(item, "call_id", None)] = args.get("route_reason")
+            elif item.name == "create_handoff_summary" and args.get("route_id"):
+                summarised.add(args["route_id"])
+        elif kind == "function_call_output" and item.call_id in reason_by_call:
+            route_id = _returned_ids(item.output).get("route_id")
+            if route_id and reason_by_call[item.call_id] != "non_qualified":
+                routes.append((route_id, reason_by_call[item.call_id]))
+    return [r for r in routes if r[0] not in summarised]
+
+
 def _end_call_precondition(session) -> tuple[str, str] | None:
     """What still has to happen before this call may end, as (key, instruction).
 
@@ -475,6 +587,15 @@ def _end_call_precondition(session) -> tuple[str, str] | None:
                 "normal. That route is the complete record; do not create a handoff summary for it.\n"
                 "4. The caller has an issue with an existing plan: call route_medicare_call with "
                 "route_reason member_services and the service_issue_type, then record the handoff.")
+    unrecorded = _routes_without_handoff(items)
+    if unrecorded:
+        # MS76: with two requests on one call, the member-services route was made
+        # and only the sales handoff was written up.
+        listed = ", ".join(f"{route_id} ({reason})" for route_id, reason in unrecorded)
+        return ("handoff", f"A route on this call has no handoff record: {listed}. Call "
+                "create_handoff_summary for it now, with its route_id and the route_status and "
+                "destination that route returned (summary_type member_services_redirect for a "
+                "member-services route). Then end the call.")
     if not caller_done:
         # the agent's message just before the caller's latest turn
         prev_agent = ""
@@ -726,6 +847,8 @@ class BenchmarkAgent(Agent):
         self._first_message = first_message
         self._id_consumers = _id_consumers(tool_defs or [])
         self._required_ids = _required_ids(tool_defs or [])
+        self._phone_args = _phone_arguments(tool_defs or [])
+        self._phone_reasks = 0
 
     async def llm_node(self, chat_ctx, tools, model_settings):
         if not ARG_REPAIR:
@@ -733,12 +856,32 @@ class BenchmarkAgent(Agent):
                 yield chunk
             return
         ctx, latest, outputs = _with_id_notes(chat_ctx, self._id_consumers)
+        caller_digits = _caller_digits(chat_ctx)
+        held = False  # a tool call whose phone number the caller never said was withheld
         async for chunk in Agent.default.llm_node(self, ctx, tools, model_settings):
             delta = getattr(chunk, "delta", None)
-            for tool_call in getattr(delta, "tool_calls", None) or ():
+            tool_calls = getattr(delta, "tool_calls", None) or []
+            if tool_calls and not held and self._phone_reasks < MAX_PHONE_REASKS:
+                for index, tool_call in enumerate(tool_calls):
+                    bad = _bad_phone(tool_call.name, tool_call.arguments, self._phone_args, caller_digits)
+                    if bad is not None:
+                        # keep the calls before it; this one and any after it wait
+                        # for the corrected number
+                        held, tool_calls = True, tool_calls[:index]
+                        self._phone_reasks += 1
+                        logger.info("held %s: phone %r is not a ten-digit number the caller said; asking again (%d)",
+                                    tool_call.name, bad, self._phone_reasks)
+                        break
+                if held:
+                    delta.tool_calls = tool_calls
+            elif tool_calls and held:
+                delta.tool_calls = tool_calls = []
+            for tool_call in tool_calls:
                 tool_call.arguments = _repair_tool_arguments(
                     tool_call.name, tool_call.arguments, self._required_ids, latest, outputs)
             yield chunk
+        if held:
+            yield PHONE_REASK
 
     async def on_enter(self):
         # Fixed first message: speak it deterministically via session.say() so it
